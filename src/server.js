@@ -27,6 +27,7 @@ const app = express();
 const port = Number(process.env.PORT || 3000);
 const sessionDays = Number(process.env.SESSION_DAYS || 14);
 const emailCodeTtlMinutes = Number(process.env.EMAIL_CODE_TTL_MINUTES || 10);
+const externalTimeoutMs = Number(process.env.EXTERNAL_TIMEOUT_MS || 25000);
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY, {
   auth: { persistSession: false }
 });
@@ -98,9 +99,23 @@ function sendError(res, status, code, message) {
   res.status(status).json({ ok: false, code, message });
 }
 
+function withTimeout(promise, label, timeoutMs = externalTimeoutMs) {
+  let timer;
+  const timeout = new Promise((_resolve, reject) => {
+    timer = setTimeout(() => {
+      const error = new Error(`${label} timed out`);
+      error.status = 504;
+      error.code = "TIMEOUT";
+      reject(error);
+    }, timeoutMs);
+  });
+
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
 async function sendEmailCode(email, code, purpose) {
   const title = purpose === "reset" ? "Password reset code" : "Project Battle verification code";
-  await resend.emails.send({
+  const result = await withTimeout(resend.emails.send({
     from: process.env.RESEND_FROM,
     to: email,
     subject: title,
@@ -112,17 +127,39 @@ async function sendEmailCode(email, code, purpose) {
         <p style="color:#a9afa9">The code expires in ${emailCodeTtlMinutes} minutes.</p>
       </div>
     `
-  });
+  }), "Email provider");
+
+  if (result?.error) {
+    const error = new Error(result.error.message || "Email provider error");
+    error.status = 502;
+    error.code = result.error.name || "EMAIL_PROVIDER_ERROR";
+    throw error;
+  }
 }
+
+app.get("/debug/config", (_req, res) => {
+  res.json({
+    ok: true,
+    hasSupabaseUrl: Boolean(process.env.SUPABASE_URL),
+    hasSupabaseServiceRoleKey: Boolean(process.env.SUPABASE_SERVICE_ROLE_KEY),
+    hasResendApiKey: Boolean(process.env.RESEND_API_KEY),
+    resendFrom: process.env.RESEND_FROM || null,
+    hasJwtSecret: Boolean(process.env.JWT_SECRET),
+    hasMinecraftServerSecret: Boolean(process.env.MINECRAFT_SERVER_SECRET),
+    emailCodeTtlMinutes,
+    sessionDays,
+    externalTimeoutMs
+  });
+});
 
 async function createSession(user) {
   const token = crypto.randomBytes(48).toString("base64url");
   const expiresAt = new Date(Date.now() + sessionDays * 24 * 60 * 60 * 1000);
-  const { error } = await supabase.from("pb_sessions").insert({
+  const { error } = await withTimeout(supabase.from("pb_sessions").insert({
     user_id: user.id,
     token_hash: sha256(token),
     expires_at: expiresAt.toISOString()
-  });
+  }), "Database session insert");
   if (error) throw error;
 
   const jwtToken = jwt.sign(
@@ -139,27 +176,27 @@ async function createSession(user) {
 }
 
 async function getUserByEmail(email) {
-  const { data, error } = await supabase
+  const { data, error } = await withTimeout(supabase
     .from("pb_users")
     .select("*")
     .eq("email", email)
-    .maybeSingle();
+    .maybeSingle(), "Database get user by email");
   if (error) throw error;
   return data;
 }
 
 async function getUserByNickname(nickname) {
-  const { data, error } = await supabase
+  const { data, error } = await withTimeout(supabase
     .from("pb_users")
     .select("*")
     .eq("nickname", nickname)
-    .maybeSingle();
+    .maybeSingle(), "Database get user by nickname");
   if (error) throw error;
   return data;
 }
 
 async function verifyCode(email, code, purpose) {
-  const { data, error } = await supabase
+  const { data, error } = await withTimeout(supabase
     .from("pb_email_codes")
     .select("*")
     .eq("email", email)
@@ -169,14 +206,14 @@ async function verifyCode(email, code, purpose) {
     .gt("expires_at", new Date().toISOString())
     .order("created_at", { ascending: false })
     .limit(1)
-    .maybeSingle();
+    .maybeSingle(), "Database verify code");
   if (error) throw error;
   if (!data) return false;
 
-  const { error: updateError } = await supabase
+  const { error: updateError } = await withTimeout(supabase
     .from("pb_email_codes")
     .update({ used: true })
-    .eq("id", data.id);
+    .eq("id", data.id), "Database mark code used");
   if (updateError) throw updateError;
   return true;
 }
@@ -200,18 +237,18 @@ app.post("/auth/start-register", async (req, res, next) => {
     }
 
     if (!existing) {
-      const { error } = await supabase.from("pb_users").insert({ email });
+      const { error } = await withTimeout(supabase.from("pb_users").insert({ email }), "Database user insert");
       if (error) throw error;
     }
 
     const code = generateCode();
     const expiresAt = new Date(Date.now() + emailCodeTtlMinutes * 60 * 1000);
-    const { error } = await supabase.from("pb_email_codes").insert({
+    const { error } = await withTimeout(supabase.from("pb_email_codes").insert({
       email,
       purpose: "register",
       code,
       expires_at: expiresAt.toISOString()
-    });
+    }), "Database email code insert");
     if (error) throw error;
 
     await sendEmailCode(email, code, "register");
@@ -230,12 +267,12 @@ app.post("/auth/verify-email", async (req, res, next) => {
       return;
     }
 
-    const { data, error } = await supabase
+    const { data, error } = await withTimeout(supabase
       .from("pb_users")
       .update({ email_verified: true, updated_at: new Date().toISOString() })
       .eq("email", email)
       .select("*")
-      .single();
+      .single(), "Database verify email update");
     if (error) throw error;
 
     res.json({ ok: true, user: publicUser(data) });
@@ -276,7 +313,7 @@ app.post("/auth/finish-register", async (req, res, next) => {
     }
 
     const passwordHash = await bcrypt.hash(password, 12);
-    const { data, error } = await supabase
+    const { data, error } = await withTimeout(supabase
       .from("pb_users")
       .update({
         nickname,
@@ -285,7 +322,7 @@ app.post("/auth/finish-register", async (req, res, next) => {
       })
       .eq("id", user.id)
       .select("*")
-      .single();
+      .single(), "Database finish register update");
     if (error) throw error;
 
     const session = await createSession(data);
@@ -320,12 +357,12 @@ app.post("/auth/login", async (req, res, next) => {
 
     const code = generateCode();
     const expiresAt = new Date(Date.now() + emailCodeTtlMinutes * 60 * 1000);
-    const { error } = await supabase.from("pb_email_codes").insert({
+    const { error } = await withTimeout(supabase.from("pb_email_codes").insert({
       email: user.email,
       purpose: "login",
       code,
       expires_at: expiresAt.toISOString()
-    });
+    }), "Database login code insert");
     if (error) throw error;
 
     await sendEmailCode(user.email, code, "login");
@@ -375,12 +412,12 @@ app.post("/auth/forgot-password", async (req, res, next) => {
     if (user) {
       const code = generateCode();
       const expiresAt = new Date(Date.now() + emailCodeTtlMinutes * 60 * 1000);
-      const { error } = await supabase.from("pb_email_codes").insert({
+      const { error } = await withTimeout(supabase.from("pb_email_codes").insert({
         email,
         purpose: "reset",
         code,
         expires_at: expiresAt.toISOString()
-      });
+      }), "Database reset code insert");
       if (error) throw error;
       await sendEmailCode(email, code, "reset");
     }
@@ -407,10 +444,10 @@ app.post("/auth/reset-password", async (req, res, next) => {
     }
 
     const passwordHash = await bcrypt.hash(password, 12);
-    const { error } = await supabase
+    const { error } = await withTimeout(supabase
       .from("pb_users")
       .update({ password_hash: passwordHash, updated_at: new Date().toISOString() })
-      .eq("email", email);
+      .eq("email", email), "Database reset password update");
     if (error) throw error;
 
     res.json({ ok: true });
@@ -429,12 +466,12 @@ app.get("/auth/me", async (req, res, next) => {
     }
 
     const tokenHash = sha256(token);
-    const { data: session, error: sessionError } = await supabase
+    const { data: session, error: sessionError } = await withTimeout(supabase
       .from("pb_sessions")
       .select("*, pb_users(*)")
       .eq("token_hash", tokenHash)
       .gt("expires_at", new Date().toISOString())
-      .maybeSingle();
+      .maybeSingle(), "Database current session lookup");
     if (sessionError) throw sessionError;
     if (!session?.pb_users) {
       sendError(res, 401, "INVALID_TOKEN", "Invalid token");
@@ -452,7 +489,7 @@ app.post("/auth/logout", async (req, res, next) => {
     const authHeader = req.headers.authorization || "";
     const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
     if (token) {
-      await supabase.from("pb_sessions").delete().eq("token_hash", sha256(token));
+      await withTimeout(supabase.from("pb_sessions").delete().eq("token_hash", sha256(token)), "Database logout");
     }
     res.json({ ok: true });
   } catch (error) {
@@ -475,12 +512,12 @@ app.post("/auth/minecraft/verify", async (req, res, next) => {
       return;
     }
 
-    const { data: session, error } = await supabase
+    const { data: session, error } = await withTimeout(supabase
       .from("pb_sessions")
       .select("*, pb_users(*)")
       .eq("token_hash", sha256(token))
       .gt("expires_at", new Date().toISOString())
-      .maybeSingle();
+      .maybeSingle(), "Database minecraft session lookup");
     if (error) throw error;
 
     const user = session?.pb_users;
@@ -498,13 +535,26 @@ app.post("/auth/minecraft/verify", async (req, res, next) => {
 
 app.use((error, _req, res, _next) => {
   console.error(error);
-  res.status(500).json({
+  const status = Number(error.status || 500);
+  const detail = error?.message || error?.details || error?.hint || error?.code;
+  res.status(status).json({
     ok: false,
-    code: "INTERNAL_ERROR",
-    message: "Internal server error"
+    code: error.code || "INTERNAL_ERROR",
+    message: detail || "Internal server error"
   });
 });
 
 app.listen(port, () => {
   console.log(`Project Battle Auth API listening on port ${port}`);
+  supabase
+    .from("pb_users")
+    .select("id", { count: "exact", head: true })
+    .then(({ error }) => {
+      if (error) {
+        console.error("Supabase startup check failed:", error);
+      } else {
+        console.log("Supabase startup check passed.");
+      }
+    })
+    .catch((error) => console.error("Supabase startup check failed:", error));
 });
