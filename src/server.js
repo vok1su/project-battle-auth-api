@@ -27,6 +27,7 @@ const app = express();
 const port = Number(process.env.PORT || 3000);
 const sessionDays = Number(process.env.SESSION_DAYS || 14);
 const emailCodeTtlMinutes = Number(process.env.EMAIL_CODE_TTL_MINUTES || 10);
+const minecraftTicketTtlMinutes = Number(process.env.MINECRAFT_TICKET_TTL_MINUTES || 30);
 const externalTimeoutMs = Number(process.env.EXTERNAL_TIMEOUT_MS || 25000);
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY, {
   auth: { persistSession: false }
@@ -508,7 +509,7 @@ app.post("/auth/minecraft/ticket", async (req, res, next) => {
     }
 
     const ticket = crypto.randomBytes(32).toString("base64url");
-    const expiresAt = new Date(Date.now() + 2 * 60 * 1000);
+    const expiresAt = new Date(Date.now() + minecraftTicketTtlMinutes * 60 * 1000);
     const { error } = await withTimeout(supabase.from("pb_game_tickets").insert({
       user_id: user.id,
       nickname: user.nickname,
