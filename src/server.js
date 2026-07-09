@@ -83,7 +83,8 @@ function publicUser(user) {
     id: user.id,
     email: user.email,
     nickname: user.nickname,
-    emailVerified: user.email_verified
+    emailVerified: user.email_verified,
+    role: user.role || "user"
   };
 }
 
@@ -173,6 +174,21 @@ async function createSession(user) {
     jwt: jwtToken,
     expiresAt: expiresAt.toISOString()
   };
+}
+
+async function authenticatedUser(req) {
+  const authHeader = req.headers.authorization || "";
+  const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
+  if (!token) return null;
+
+  const { data: session, error } = await withTimeout(supabase
+    .from("pb_sessions")
+    .select("*, pb_users(*)")
+    .eq("token_hash", sha256(token))
+    .gt("expires_at", new Date().toISOString())
+    .maybeSingle(), "Database authenticated session lookup");
+  if (error) throw error;
+  return session?.pb_users || null;
 }
 
 async function getUserByEmail(email) {
@@ -458,27 +474,13 @@ app.post("/auth/reset-password", async (req, res, next) => {
 
 app.get("/auth/me", async (req, res, next) => {
   try {
-    const authHeader = req.headers.authorization || "";
-    const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
-    if (!token) {
-      sendError(res, 401, "NO_TOKEN", "No token");
-      return;
-    }
-
-    const tokenHash = sha256(token);
-    const { data: session, error: sessionError } = await withTimeout(supabase
-      .from("pb_sessions")
-      .select("*, pb_users(*)")
-      .eq("token_hash", tokenHash)
-      .gt("expires_at", new Date().toISOString())
-      .maybeSingle(), "Database current session lookup");
-    if (sessionError) throw sessionError;
-    if (!session?.pb_users) {
+    const user = await authenticatedUser(req);
+    if (!user) {
       sendError(res, 401, "INVALID_TOKEN", "Invalid token");
       return;
     }
 
-    res.json({ ok: true, user: publicUser(session.pb_users) });
+    res.json({ ok: true, user: publicUser(user) });
   } catch (error) {
     next(error);
   }
@@ -497,6 +499,35 @@ app.post("/auth/logout", async (req, res, next) => {
   }
 });
 
+app.post("/auth/minecraft/ticket", async (req, res, next) => {
+  try {
+    const user = await authenticatedUser(req);
+    if (!user?.email_verified || !user.nickname) {
+      sendError(res, 401, "INVALID_TOKEN", "Valid Project Battle account required");
+      return;
+    }
+
+    const ticket = crypto.randomBytes(32).toString("base64url");
+    const expiresAt = new Date(Date.now() + 2 * 60 * 1000);
+    const { error } = await withTimeout(supabase.from("pb_game_tickets").insert({
+      user_id: user.id,
+      nickname: user.nickname,
+      token_hash: sha256(ticket),
+      expires_at: expiresAt.toISOString()
+    }), "Database game ticket insert");
+    if (error) throw error;
+
+    res.json({
+      ok: true,
+      ticket,
+      nickname: user.nickname,
+      expiresAt: expiresAt.toISOString()
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.post("/auth/minecraft/verify", async (req, res, next) => {
   try {
     const serverSecret = req.headers["x-server-secret"];
@@ -506,27 +537,36 @@ app.post("/auth/minecraft/verify", async (req, res, next) => {
     }
 
     const nickname = normalizeNickname(req.body.nickname);
-    const token = String(req.body.token || "");
-    if (!nickname || !token) {
-      sendError(res, 400, "BAD_REQUEST", "nickname and token are required");
+    const ticket = String(req.body.ticket || req.body.token || "");
+    if (!nickname || !ticket) {
+      sendError(res, 400, "BAD_REQUEST", "nickname and ticket are required");
       return;
     }
 
-    const { data: session, error } = await withTimeout(supabase
-      .from("pb_sessions")
+    const { data: gameTicket, error } = await withTimeout(supabase
+      .from("pb_game_tickets")
       .select("*, pb_users(*)")
-      .eq("token_hash", sha256(token))
+      .eq("token_hash", sha256(ticket))
+      .is("used_at", null)
       .gt("expires_at", new Date().toISOString())
-      .maybeSingle(), "Database minecraft session lookup");
+      .maybeSingle(), "Database minecraft ticket lookup");
     if (error) throw error;
 
-    const user = session?.pb_users;
-    const allowed = Boolean(user?.email_verified && user.nickname === nickname);
+    const user = gameTicket?.pb_users;
+    const allowed = Boolean(user?.email_verified && user.nickname === nickname && gameTicket.nickname === nickname);
+    if (allowed) {
+      const { error: consumeError } = await withTimeout(supabase
+        .from("pb_game_tickets")
+        .update({ used_at: new Date().toISOString() })
+        .eq("id", gameTicket.id)
+        .is("used_at", null), "Database consume game ticket");
+      if (consumeError) throw consumeError;
+    }
     res.json({
       ok: true,
       allowed,
       nickname: user?.nickname || null,
-      reason: allowed ? null : "Invalid Project Battle account session"
+      reason: allowed ? null : "Invalid or expired Project Battle game ticket"
     });
   } catch (error) {
     next(error);
